@@ -14,25 +14,22 @@ namespace PublishToSB
     {
         static void Main(string[] args)
         {
+            #region Connect
             // Endpoint=sb://sb-sbb-poc.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=Cy1XqTOptinUgrjAWn29p5M8y8pgfYkFBELA6XES9yU=
             var sasKeyName = "RootManageSharedAccessKey";
             var sasKeyValue = "Cy1XqTOptinUgrjAWn29p5M8y8pgfYkFBELA6XES9yU=";
             var sbNamespace = "sb-sbb-poc";
 
-            // Create management credentials
-            TokenProvider credentials = TokenProvider.CreateSharedAccessSignatureTokenProvider(sasKeyName, sasKeyValue);
-
-            // Create SB service uri
+            // Connect to SB
+            var credentials = TokenProvider.CreateSharedAccessSignatureTokenProvider(sasKeyName, sasKeyValue);
             var sbUri = ServiceBusEnvironment.CreateServiceUri("sb", sbNamespace, string.Empty);
+            var nsClient = new NamespaceManager(sbUri, credentials);
 
-            // Create namespace client
-            NamespaceManager namespaceClient = new NamespaceManager(sbUri, credentials);
-
-            // Create topic
-            var topicName = "ProfielfotoMutaties";
-            var topic = namespaceClient.TopicExists(topicName)
-                ? namespaceClient.GetTopic(topicName)
-                : namespaceClient.CreateTopic(new TopicDescription(topicName)
+            // Create topic if not yet exists
+            var topicName = "TopicRobert";
+            var topic = nsClient.TopicExists(topicName)
+                ? nsClient.GetTopic(topicName)
+                : nsClient.CreateTopic(new TopicDescription(topicName)
                 {
                     DefaultMessageTimeToLive = TimeSpan.FromDays(3),
                     EnablePartitioning = true,
@@ -40,36 +37,67 @@ namespace PublishToSB
                     SupportOrdering = true,
                 });
 
-            // Create subscription
-            var subscriptionName = "ProfielfotoMutatiesNaarBackoffice";
-            var subscription = namespaceClient.SubscriptionExists(topicName, subscriptionName)
-                ? namespaceClient.GetSubscription(topicName, subscriptionName)
-                : namespaceClient.CreateSubscription(new SubscriptionDescription(topicName, subscriptionName)
+            // ReCreate subscription
+            var subscriptionName = "SubRobert";
+            var visibilityTimeout = TimeSpan.FromSeconds(2);
+            if (nsClient.SubscriptionExists(topicName, subscriptionName))
+                nsClient.DeleteSubscription(topicName, subscriptionName); // Delete existing to quickly clear all existing messages as well
+            var subscription = nsClient.CreateSubscription(new SubscriptionDescription(topicName, subscriptionName)
                 {
-                    LockDuration = TimeSpan.FromSeconds(120),
+                    LockDuration = visibilityTimeout,
                     MaxDeliveryCount = 10, // retries
+                    RequiresSession = true,
                 });
 
             // Create Topic and Subscription clients
             var msgFactory = MessagingFactory.Create(sbUri, credentials);
             var topicClient = msgFactory.CreateTopicClient(topicName);
-            var subscriptionClient = msgFactory.CreateSubscriptionClient(topicName, subscriptionName, ReceiveMode.PeekLock);
+            var subClient = msgFactory.CreateSubscriptionClient(topicName, subscriptionName, ReceiveMode.PeekLock);
+            #endregion
 
             // Send message to topic
-            topicClient.Send(CreateMessage());
+            topicClient.Send(CreateMessage("A", $"1-{DateTime.UtcNow.Ticks}"));
+            topicClient.Send(CreateMessage("A", $"2-{DateTime.UtcNow.Ticks}"));
+            topicClient.Send(CreateMessage("B", $"1-{DateTime.UtcNow.Ticks}"));
 
             // Get message from subscription
-            var subscriptionMsg = subscriptionClient.Receive(TimeSpan.FromSeconds(5));
+            var sessions = subClient.GetMessageSessions();
+
+            sessions.AsParallel().ForAll(sesBrowser =>
+            {
+                var ses = subClient.AcceptMessageSession(sesBrowser.SessionId, TimeSpan.FromSeconds(1));
+                if (ses != null)
+                {
+                    Console.WriteLine($"Session: {ses.SessionId}");
+                    var msg = ses.Receive(TimeSpan.FromSeconds(1));
+                    Console.WriteLine($"{ses.SessionId}-{msg.Label}-{msg.MessageId} (1)");
+                    msg = ses.Receive(TimeSpan.FromSeconds(1));
+                    if (msg != null)
+                        Console.WriteLine($"{ses.SessionId}-{msg.Label}-{msg.MessageId} (2)");
+
+                    ses.Close();
+                }
+            });
+
+            //var msg1 = subClient.Receive(TimeSpan.FromSeconds(1));
+            //var msg2 = subClient.Receive(TimeSpan.FromSeconds(1));
+            //var msg3 = subClient.Receive(TimeSpan.FromSeconds(1));
+
+
+            #region Poll continuously
+            /*
             if (subscriptionMsg != null)
             {
-                using (var outputStream = File.OpenWrite("profielfoto-ontvangen.gif"))
+                using (var outputStream = File.OpenWrite("profielfoto-ontvangen.gif.txt"))
                 {
                     subscriptionMsg.GetBody<Stream>().CopyTo(outputStream);
                     outputStream.Close();
                 }
                 subscriptionMsg.Complete();
             }
+            */
 
+            /*
             // Poll continuously for new messages
             var options = new OnMessageOptions
             {
@@ -100,28 +128,35 @@ namespace PublishToSB
             }; // Cancel must be true, to make sure the process is not killed and we can clean up nicely below
 
             // Now that it's polling for new messages, lets publish some...
-            topicClient.Send(CreateMessage("1"));
-            topicClient.Send(CreateMessage("2"));
-            topicClient.Send(CreateMessage("3"));
-            topicClient.Send(CreateMessage("1"));
+            //topicClient.Send(CreateMessage("1"));
+            //topicClient.Send(CreateMessage("2"));
+            //topicClient.Send(CreateMessage("3"));
+            //topicClient.Send(CreateMessage("1"));
 
             handle.WaitOne(); // Wait until Ctrl-C is pressed
-            subscriptionClient.Close();
+            */
+            #endregion
 
-            // Publish a last message
-            topicClient.Send(CreateMessage("4"));
+            #region Disconnect
+            subClient.Close();
+            topicClient.Close();
+            #endregion
         }
 
-        public static BrokeredMessage CreateMessage(string id = "5")
+        public static BrokeredMessage CreateMessage(string functionalKey = "5", string stringContent = null)
         {
-            var topicMsg = new BrokeredMessage(File.OpenRead("profielfoto.gif"), true)
+            Stream contentStream = (stringContent != null)
+                ? (Stream)new MemoryStream(Encoding.UTF8.GetBytes(stringContent))
+                : File.OpenRead("profielfoto.gif");
+
+            var topicMsg = new BrokeredMessage(contentStream, true)
             {
                 MessageId = Guid.NewGuid().ToString(),
-                Label = "Profielfoto",
-                SessionId = id,
-                PartitionKey = id,
+                Label = stringContent ?? "ProfielFoto",
+                SessionId = functionalKey,
+                PartitionKey = functionalKey,
             };
-            topicMsg.Properties["UserID"] = "5";
+            topicMsg.Properties["FunctionalKey"] = functionalKey;
             return topicMsg;
         }
     }
